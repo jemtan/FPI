@@ -3,6 +3,12 @@
 ### Abstract:
 In medical imaging, outliers can contain hypo/hyper-intensities, minor deformations, or completely different anatomy altogether. To detect these irregularities it is helpful to learn the features present in both normal and abnormal images. However this is difficult because of the wide range of possible abnormalities and also the number of ways that normal anatomy can vary naturally. As such, we leverage the natural variations in normal anatomy to create a range of synthetic abnormalities. Specifically, the same patch region is extracted from two independent samples and is replaced with an interpolation between both patches. The interpolation factor, patch size, and patch location are randomly sampled from uniform distributions. A wide residual encoder decoder is trained to give a pixel-wise prediction of the patch and its interpolation factor. This encourages the network to learn what features to expect normally and to identify where foreign patterns have been introduced. However, optimization must be done carefully to avoid overfitting to the self-supervised task because generalization is essential for outlier detection with this type of approach. The outlier score is derived directly from the estimate of the interpolation factor. Meanwhile the pixel-wise output allows for pixel- and subject- level predictions using the same model.
 
+### MOOD Challenge Information:
+Please see link below for more information on the MOOD challenge and instructions for data access:  
+```
+http://medicalood.dkfz.de/web/
+```
+
 ### Key files:  
 self_sup_task.py - FPI operation used to create self-supervised task  
 fpiSubmit.py - training/testing loops  
