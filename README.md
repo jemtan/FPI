@@ -39,11 +39,12 @@ Note that there are no test samples provided, but you can create your own and pr
 
 
 #### Disclaimer
-This is an initial release which uses very old packages. These will be updated soon to make the code more accessible. If you prefer, you can use the code in self_sup_task.py to train your own architecture.    
+Now updated to tensorflow 2. If you prefer, you can use the code in self_sup_task.py to train your own architecture.    
 
-This repository includes code from the respository linked below. In particular, the network architecture is built on top of their wide resnet implementation. The linked repository is a great outlier detection method also based on a self-supervised task. If you are interested in this topic I definitely recommend you check out their paper/code!
+This repository includes code from the respositories linked below. In particular, the network architecture is built on top of their wide resnet implementation. The linked repository is a great outlier detection method also based on a self-supervised task. If you are interested in this topic I definitely recommend you check out their paper/code!
 ```
 https://github.com/izikgo/AnomalyDetectionTransformations
+https://github.com/asmith26/wide_resnets_keras.git
 ```
 
 ### Author Information
