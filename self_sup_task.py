@@ -1,10 +1,13 @@
-import abc
-import itertools
 import numpy as np
+import tensorflow as tf
 
-from keras.preprocessing.image import apply_affine_transform
-from keras.utils import to_categorical
-import copy
+to_categorical = tf.keras.utils.to_categorical
+'''
+def to_categorical(y,num_classes):
+    onehot = np.zeros((len(y), num_classes))
+    onehot[np.arange(len(y)),y] = 1
+    return onehot
+'''
 
 def create_interp_mask(ima,patch_center,patch_width,patch_interp):
     dims=np.shape(ima)
@@ -21,6 +24,8 @@ def create_interp_mask(ima,patch_center,patch_width,patch_interp):
                coor_min[0]:coor_max[0],
                coor_min[1]:coor_max[1]] = patch_interp[frame_ind]
     return mask_i
+
+
 
 def patch_ex(ima1,ima2,num_classes=None,core_percent=0.8,tolerance=None):
     #exchange patches between two image arrays based on a random interpolation factor
@@ -41,8 +46,8 @@ def patch_ex(ima1,ima2,num_classes=None,core_percent=0.8,tolerance=None):
         #interpolation factor between 5 and 95%
         patch_interp = np.random.uniform(0.05,0.95,size=dims[0])
     else:
-        #interpolation between 0 and 1, with num_classes options
-        patch_interp = np.random.choice(num_classes-1,size=dims[0])/(num_classes-1)#subtract 1 to exclude default (0) class
+        #interpolation between 0 and 1, num class options
+        patch_interp = np.random.choice(num_classes-1,size=dims[0])/(num_classes-1)#subtract 1 to exclude default class
         
     offset = 1E-5#offset to separate 0 patches from background
     mask_i = create_interp_mask(ima1,patch_center,patch_width,patch_interp+offset)
@@ -56,7 +61,6 @@ def patch_ex(ima1,ima2,num_classes=None,core_percent=0.8,tolerance=None):
 
     patchex1 = ima1*zero_mask + patch_set1
     patchex2 = ima2*zero_mask + patch_set2
-
 
     if tolerance:
         valid_label = np.any(
@@ -72,6 +76,6 @@ def patch_ex(ima1,ima2,num_classes=None,core_percent=0.8,tolerance=None):
         label = label*(num_classes-1)
         label = to_categorical(label,num_classes)
 
-    return patchex1, patchex2, label
+    return (patchex1,label), (patchex2, label)
 
 

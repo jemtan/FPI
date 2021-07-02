@@ -1,230 +1,281 @@
-from keras.models import Model
-from keras.layers import *
-from keras.regularizers import l2
-from keras.initializers import _compute_fans
-from keras.optimizers import SGD
-from keras import backend as K
-from keras.utils import to_categorical
+#using code from https://github.com/asmith26/wide_resnets_keras.git
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
+from six.moves import range
+import os
+
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+import sys
+#sys.stdout = sys.stderr
+# Prevent reaching to maximum recursion depth in `theano.tensor.grad`
+#sys.setrecursionlimit(2 ** 20)
+
+import numpy as np
+np.random.seed(2 ** 10)
+
+from tensorflow.keras.datasets import cifar10
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Conv2D, AveragePooling2D, BatchNormalization, Dropout, Input, Activation, Add, Dense, Flatten, UpSampling2D, Lambda, Concatenate
+from tensorflow.keras.optimizers import SGD, Adam
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras import losses
+from tensorflow.keras.callbacks import LearningRateScheduler, ModelCheckpoint
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import backend as K
 import tensorflow as tf
+from functools import partial
 
-WEIGHT_DECAY = 0.5 * 0.0005
-LARGE_NUM = 1e9
+USE_BIAS = False # no bias in conv
+WEIGHT_INIT = "he_normal" 
+WEIGHT_DECAY = 0.0005 
+CHANNEL_AXIS = -1
 
-class SGDTorch(SGD):
-    @interfaces.legacy_get_updates_support
-    def get_updates(self, loss, params):
-        grads = self.get_gradients(loss, params)
-        self.updates = [K.update_add(self.iterations, 1)]
 
-        lr = self.lr
-        if self.initial_decay > 0:
-            lr *= (1. / (1. + self.decay * K.cast(self.iterations,
-                                                  K.dtype(self.decay))))
-        # momentum
-        shapes = [K.int_shape(p) for p in params]
-        moments = [K.zeros(shape) for shape in shapes]
-        self.weights = [self.iterations] + moments
-        for p, g, m in zip(params, grads, moments):
-            v = self.momentum * m + g  # velocity
-            self.updates.append(K.update(m, v))
+# Wide residual network http://arxiv.org/abs/1605.07146
+def _wide_basic(n_input_plane, n_output_plane, stride, dropout_probability=0.0, direction='down'):
+    def f(net):
+        # format of conv_params:
+        #               [ [nb_col="kernel width", nb_row="kernel height",
+        #               subsample="(stride_vertical,stride_horizontal)",
+        #               border_mode="same" or "valid"] ]
+        # B(3,3): orignal <<basic>> block
+        if direction == 'up':
+            conv_params = [ [3,3,(1,1),"same"],
+                            [3,3,(1,1),"same"] ]        
+        else:
+            conv_params = [ [3,3,stride,"same"],
+                            [3,3,(1,1),"same"] ]
+ 
+        n_bottleneck_plane = n_output_plane
 
-            if self.nesterov:
-                new_p = p - lr * (self.momentum * v + g)
+        # Residual block
+        for i, v in enumerate(conv_params):
+            if i == 0:
+                if n_input_plane != n_output_plane:
+                    net = BatchNormalization(axis=CHANNEL_AXIS)(net)
+                    net = Activation("relu")(net)
+                    convs = net
+                else:
+                    convs = BatchNormalization(axis=CHANNEL_AXIS)(net)
+                    convs = Activation("relu")(convs)
+                convs = Conv2D(n_bottleneck_plane, 
+                               (v[0],v[1]),
+                                strides=v[2],
+                                padding=v[3],
+                                kernel_initializer=WEIGHT_INIT,
+                                kernel_regularizer=l2(WEIGHT_DECAY),
+                                use_bias=USE_BIAS)(convs)
+                if direction == 'up':
+                    convs = UpSampling2D(stride)(convs)
             else:
-                new_p = p - lr * v
+                convs = BatchNormalization(axis=CHANNEL_AXIS)(convs)
+                convs = Activation("relu")(convs)
+                if dropout_probability > 0:
+                   convs = Dropout(dropout_probability)(convs)
+                convs = Conv2D(n_bottleneck_plane, 
+                               (v[0],v[1]),
+                                strides=v[2],
+                                padding=v[3],
+                                kernel_initializer=WEIGHT_INIT,
+                                kernel_regularizer=l2(WEIGHT_DECAY),
+                                use_bias=USE_BIAS)(convs)
 
-            # Apply constraints.
-            if getattr(p, 'constraint', None) is not None:
-                new_p = p.constraint(new_p)
+        # Shortcut Conntection: identity function or 1x1 convolutional
+        #  (depends on difference between input & output shape - this
+        #   corresponds to whether we are using the first block in each
+        #   group; see _layer() ).
+        if n_input_plane != n_output_plane:
+            shortcut_stride = 1 if direction == 'up' else stride
+            shortcut = Conv2D(n_output_plane, 
+                              (1,1),
+                              strides=shortcut_stride,
+                              padding="same",
+                              kernel_initializer=WEIGHT_INIT,
+                              kernel_regularizer=l2(WEIGHT_DECAY),
+                              use_bias=USE_BIAS)(net)
+            if direction == 'up':
+                shortcut = UpSampling2D(stride)(shortcut)
+        else:
+            if stride == 1:
+                shortcut = net
+            elif direction == 'up':
+                shortcut = UpSampling2D(stride)(net)
+            else:
+                shortcut = AveragePooling2D(stride)(net) 
+            
 
-            self.updates.append(K.update(p, new_p))
-        return self.updates
-
-
-def _get_channels_axis():
-    return -1 if K.image_data_format() == 'channels_last' else 1
-
-
-def _conv_kernel_initializer(shape, dtype=None):
-    fan_in, fan_out = _compute_fans(shape)
-    stddev = np.sqrt(2. / fan_in)
-    return K.random_normal(shape, 0., stddev, dtype)
-
-
-def _dense_kernel_initializer(shape, dtype=None):
-    fan_in, fan_out = _compute_fans(shape)
-    stddev = 1. / np.sqrt(fan_in)
-    return K.random_uniform(shape, -stddev, stddev, dtype)
-
-
-def batch_norm():
-    return BatchNormalization(axis=_get_channels_axis(), momentum=0.9, epsilon=1e-5,
-                              beta_regularizer=l2(WEIGHT_DECAY), gamma_regularizer=l2(WEIGHT_DECAY))
-
-
-def conv2d(output_channels, kernel_size, strides=1):
-    return Convolution2D(output_channels, kernel_size, strides=strides, padding='same', use_bias=False,
-                         kernel_initializer=_conv_kernel_initializer, kernel_regularizer=l2(WEIGHT_DECAY))
-
-
-def dense(output_units):
-    return Dense(output_units, kernel_initializer=_dense_kernel_initializer, kernel_regularizer=l2(WEIGHT_DECAY),
-                 bias_regularizer=l2(WEIGHT_DECAY))
-
-
-def _add_upsamp_block(x_in, out_channels, strides, dropout_rate=0.0):
-    is_channels_equal = K.int_shape(x_in)[_get_channels_axis()] == out_channels
-
-    bn1 = batch_norm()(x_in)
-    bn1 = Activation('relu')(bn1)
-    out = conv2d(out_channels, 3, 1)(bn1)
-    out = UpSampling2D(strides)(out)#interpolation='bilinear'
-    out = batch_norm()(out)
-    out = Activation('relu')(out)
-    out = Dropout(dropout_rate)(out)
-    out = conv2d(out_channels, 3, 1)(out)#non-strided conv
-    if is_channels_equal and strides == 1:
-        shortcut = x_in
-    elif is_channels_equal and strides == 2:
-        shortcut = UpSampling2D(strides)(x_in)#x_in or bn1?
-    else:
-        shortcut = conv2d(out_channels, 1, 1)(bn1)
-        shortcut = UpSampling2D(strides)(shortcut)
-    #shortcut = x_in if is_channels_equal else conv2d(out_channels, 1, strides)(bn1)
-    out = add([out, shortcut])
-    return out
+        return Add()([convs, shortcut])
+    
+    return f
 
 
-def _add_basic_block(x_in, out_channels, strides, dropout_rate=0.0):
-    is_channels_equal = K.int_shape(x_in)[_get_channels_axis()] == out_channels
-
-    bn1 = batch_norm()(x_in)
-    bn1 = Activation('relu')(bn1)
-    out = conv2d(out_channels, 3, strides)(bn1)
-    out = batch_norm()(out)
-    out = Activation('relu')(out)
-    out = Dropout(dropout_rate)(out)
-    out = conv2d(out_channels, 3, 1)(out)
-    if is_channels_equal and strides == 1:
-        shortcut = x_in
-    elif is_channels_equal and strides == 2:
-        shortcut = AveragePooling2D(strides)(x_in)#x_in or bn1?
-    else:
-        shortcut = conv2d(out_channels, 1, strides)(bn1)
-    #shortcut = x_in if is_channels_equal else conv2d(out_channels, 1, strides)(bn1)
-    out = add([out, shortcut])
-    return out
+# "Stacking Residual Units on the same stage"
+def _layer(block, n_input_plane, n_output_plane, count, stride, **kwargs):
+    def f(net):
+        net = block(n_input_plane, n_output_plane, stride, **kwargs)(net)
+        for i in range(2,int(count+1)):
+            net = block(n_output_plane, n_output_plane, stride=(1,1), **kwargs)(net)
+        return net
+    
+    return f
 
 
-def _add_conv_group(x_in, out_channels, n, strides, dropout_rate=0.0):
-    out = _add_basic_block(x_in, out_channels, strides, dropout_rate)
-    for _ in range(1, n):
-        out = _add_basic_block(out, out_channels, 1, dropout_rate)
-    return out
+def create_model():
+    logging.debug("Creating model...")
+    
+    assert((depth - 4) % 6 == 0)
+    n = (depth - 4) / 6
+    
+    inputs = Input(shape=input_shape)
+
+    n_stages=[16, 16*k, 32*k, 64*k]
 
 
-def _add_upsamp_group(x_in, out_channels, n, strides, dropout_rate=0.0):
-    out = _add_upsamp_block(x_in, out_channels, strides, dropout_rate)
-    for _ in range(1, n):
-        out = _add_upsamp_block(out, out_channels, 1, dropout_rate)
-    return out
+    conv1 = Conv2D(n_stages[0], 
+                    (3, 3), 
+                    strides=1,
+                    padding="same",
+                    kernel_initializer=weight_init,
+                    kernel_regularizer=l2(weight_decay),
+                    use_bias=use_bias)(inputs) # "One conv at the beginning (spatial size: 32x32)"
+
+    # Add wide residual blocks
+    block_fn = _wide_basic
+    conv2 = _layer(block_fn, n_input_plane=n_stages[0], n_output_plane=n_stages[1], count=n, stride=(1,1))(conv1)# "Stage 1 (spatial size: 32x32)"
+    conv3 = _layer(block_fn, n_input_plane=n_stages[1], n_output_plane=n_stages[2], count=n, stride=(2,2))(conv2)# "Stage 2 (spatial size: 16x16)"
+    conv4 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[3], count=n, stride=(2,2))(conv3)# "Stage 3 (spatial size: 8x8)"
+
+    batch_norm = BatchNormalization(axis=CHANNEL_AXIS)(conv4)
+    relu = Activation("relu")(batch_norm)
+                                            
+    # Classifier block
+    pool = AveragePooling2D(pool_size=(8, 8), strides=(1, 1), padding="same")(relu)
+    flatten = Flatten()(pool)
+    predictions = Dense(units=nb_classes, kernel_initializer=weight_init, use_bias=use_bias,
+                        kernel_regularizer=l2(weight_decay), activation="softmax")(flatten)
+
+    model = Model(inputs=inputs, outputs=predictions)
+    return model
 
 
-def create_wide_residual_network_dec(input_shape, num_classes, depth, widen_factor=1, dropout_rate=0.0,
-                                 final_activation='sigmoid',ret_intermediate=False):
-    n_channels = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor, 64*widen_factor, 64*widen_factor]
-    assert ((depth - 6) % 10 == 0), 'depth should be 10n+6'
+def create_wide_residual_network_dec(input_shape,num_classes,depth,k=4,dropout_probability=0.0,final_activation=None):
+    if final_activation is None:#unspecified
+        final_activation = 'softmax' if num_classes > 1 \
+            else 'sigmoid'
+   
+    assert((depth - 6) % 10 == 0), 'depth should be 10n+6'
     n = (depth - 6) // 10
+    
+    inputs = Input(shape=input_shape)
 
-    #2xn+1 conv per conv group
-    #1 + 1*numConvGroups + 2n*numConvGroups
-    inp = Input(shape=input_shape)
-    conv1 = conv2d(n_channels[0], 3)(inp)  # one conv at the beginning (spatial size: 32x32) - 256
-    conv2 = _add_conv_group(conv1, n_channels[1], n, 1, dropout_rate)  # Stage 1 (spatial size: 32x32) - 256
-    conv3 = _add_conv_group(conv2, n_channels[2], n, 2, dropout_rate)  # Stage 2 (spatial size: 16x16) - 128
-    conv4 = _add_conv_group(conv3, n_channels[3], n, 2, dropout_rate)  # Stage 3 (spatial size: 8x8) - 64
-    conv5 = _add_conv_group(conv4, n_channels[4], n, 2, dropout_rate)  # Stage 3 (spatial size: 4x4) - 32
-    conv6 = _add_conv_group(conv5, n_channels[5], n, 2, dropout_rate)  # Stage 3 (spatial size: 2x2) - 16
+    n_stages=[16, 16*k, 32*k, 64*k, 64*k, 64*k]
 
 
-    #resNet decoder - for now, keep n = 1
-    #change to nearest upsampling if need speedup
-    upsamp1 = _add_upsamp_group(conv6, n_channels[2], 1, 2, dropout_rate)  # Stage 3 (spatial size: 4x4) - 32
-    upsamp2 = _add_upsamp_group(upsamp1, n_channels[1], 1, 2, dropout_rate)  # Stage 3 (spatial size: 8x8) - 64
-    upsamp3 = _add_upsamp_group(upsamp2, n_channels[0], 1, 2, dropout_rate)  # Stage 3 (spatial size: 16x16) - 128
-    upsamp4 = _add_upsamp_group(upsamp3, num_classes, 1, 2, dropout_rate)  # Stage 3 (spatial size: 32x32) - 256
+    conv1 = Conv2D(n_stages[0], 
+                    (3, 3), 
+                    strides=1,
+                    padding="same",
+                    kernel_initializer=WEIGHT_INIT,
+                    kernel_regularizer=l2(WEIGHT_DECAY),
+                    use_bias=USE_BIAS)(inputs) # "One conv at the beginning (spatial size: 32x32)"
 
-    #add another non-linear layer?
-    logit = Lambda(lambda x:x,name='logit')(upsamp4) 
-    out = Activation(final_activation)(logit)
-    #f_x = Lambda(lambda x:x,name='f_x')(out)
+    # Add wide residual blocks
+    block_fn = _wide_basic
+    conv2 = _layer(block_fn, n_input_plane=n_stages[0], n_output_plane=n_stages[1], count=n, stride=(1,1))(conv1)# "Stage 1 (spatial size: 32x32)"
+    conv3 = _layer(block_fn, n_input_plane=n_stages[1], n_output_plane=n_stages[2], count=n, stride=(2,2))(conv2)# "Stage 2 (spatial size: 16x16)"
+    conv4 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[3], count=n, stride=(2,2))(conv3)# "Stage 3 (spatial size: 8x8)"
+    conv5 = _layer(block_fn, n_input_plane=n_stages[3], n_output_plane=n_stages[4], count=n, stride=(2,2))(conv4)# "Stage 4 (spatial size: 4x4)"
+    conv6 = _layer(block_fn, n_input_plane=n_stages[4], n_output_plane=n_stages[5], count=n, stride=(2,2))(conv5)# "Stage 5 (spatial size: 2x2)"
 
-    if ret_intermediate:
-        return Model(inp,[out,logit])
 
+    block_fn = partial(_wide_basic,direction='up')#decoder blocks,keep n=1 
+    upconv1 = _layer(block_fn, n_input_plane=n_stages[5], n_output_plane=n_stages[2], count=1, stride=(2,2))(conv6)# "Stage 1up (spatial size: 4x4)"
+    upconv2 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[1], count=1, stride=(2,2))(upconv1)# "Stage 2up (spatial size: 8x8)"
+    upconv3 = _layer(block_fn, n_input_plane=n_stages[1], n_output_plane=n_stages[0], count=1, stride=(2,2))(upconv2)# "Stage 3up (spatial size: 16x16)"
+    upconv4 = _layer(block_fn, n_input_plane=n_stages[0], n_output_plane=num_classes, count=1, stride=(2,2))(upconv3)# "Stage 4up (spatial size: 32x32)"
+
+    logit = Lambda(lambda x:x,name='logit')(upconv4)
+    if final_activation == 'linear':
+        outputs = logit
     else:
-        return Model(inp, out)
+        outputs = Activation(final_activation)(logit)
+
+    loss_f = 'categorical_crossentropy' if num_classes > 1 \
+            else 'binary_crossentropy'
+
+    return Model(inputs, outputs), loss_f
+
+def create_wide_residual_network_decdeeper(input_shape,num_classes,depth,k=4,dropout_probability=0.0,final_activation=None):
+    if final_activation is None:#unspecified
+        final_activation = 'softmax' if num_classes > 1 \
+            else 'sigmoid'
+   
+    assert((depth - 6) % 10 == 0), 'depth should be 10n+6'
+    n = (depth - 6) // 10
+    
+    inputs = Input(shape=input_shape)
+
+    n_stages=[16, 16*k, 32*k, 64*k, 64*k, 64*k, 64*k]
 
 
-def create_wide_residual_network_decdeeper(input_shape, num_classes, depth, widen_factor=1, dropout_rate=0.0,
-                                 final_activation='sigmoid',ret_intermediate=False):
-    n_channels = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor, 64*widen_factor, 64*widen_factor, 64*widen_factor]
-    assert ((depth - 7) % 12 == 0), 'depth should be 12n+7'
-    n = (depth - 7) // 12
+    conv1 = Conv2D(n_stages[0], 
+                    (3, 3), 
+                    strides=1,
+                    padding="same",
+                    kernel_initializer=WEIGHT_INIT,
+                    kernel_regularizer=l2(WEIGHT_DECAY),
+                    use_bias=USE_BIAS)(inputs) # "One conv at the beginning (spatial size: 32x32)"
 
-    #2xn+1 conv per conv group
-    #1 + 1*numConvGroups + 2n*numConvGroups
-    inp = Input(shape=input_shape)
-    conv1 = conv2d(n_channels[0], 3)(inp)  # one conv at the beginning (spatial size: 32x32) - 256
-    conv2 = _add_conv_group(conv1, n_channels[1], n, 1, dropout_rate)  # Stage 1 (spatial size: 32x32) - 256
-    conv3 = _add_conv_group(conv2, n_channels[2], n, 2, dropout_rate)  # Stage 2 (spatial size: 16x16) - 128
-    conv4 = _add_conv_group(conv3, n_channels[3], n, 2, dropout_rate)  # Stage 3 (spatial size: 8x8) - 64
-    conv5 = _add_conv_group(conv4, n_channels[4], n, 2, dropout_rate)  # Stage 3 (spatial size: 4x4) - 32
-    conv6 = _add_conv_group(conv5, n_channels[5], n, 2, dropout_rate)  # Stage 3 (spatial size: 2x2) - 16
-    conv7 = _add_conv_group(conv6, n_channels[6], n, 2, dropout_rate)  # Stage 3 (spatial size: 1x1) - 8
+    # Add wide residual blocks
+    block_fn = _wide_basic
+    conv2 = _layer(block_fn, n_input_plane=n_stages[0], n_output_plane=n_stages[1], count=n, stride=(1,1))(conv1)# "Stage 1 (spatial size: 32x32)"
+    conv3 = _layer(block_fn, n_input_plane=n_stages[1], n_output_plane=n_stages[2], count=n, stride=(2,2))(conv2)# "Stage 2 (spatial size: 16x16)"
+    conv4 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[3], count=n, stride=(2,2))(conv3)# "Stage 3 (spatial size: 8x8)"
+    conv5 = _layer(block_fn, n_input_plane=n_stages[3], n_output_plane=n_stages[4], count=n, stride=(2,2))(conv4)# "Stage 4 (spatial size: 4x4)"
+    conv6 = _layer(block_fn, n_input_plane=n_stages[4], n_output_plane=n_stages[5], count=n, stride=(2,2))(conv5)# "Stage 5 (spatial size: 2x2)"
+    conv7 = _layer(block_fn, n_input_plane=n_stages[5], n_output_plane=n_stages[6], count=n, stride=(2,2))(conv5)# "Stage 6 (spatial size: 1x1)"
 
 
-    #resNet decoder - for now, keep n = 1
-    #change to nearest upsampling if need speedup
-    upsamp1 = _add_upsamp_group(conv7, n_channels[2], 1, 2, dropout_rate)  # Stage 3 (spatial size: 4x4) - 32
-    upsamp2 = _add_upsamp_group(upsamp1, n_channels[2], 1, 2, dropout_rate)  # Stage 3 (spatial size: 4x4) - 32
-    upsamp3 = _add_upsamp_group(upsamp2, n_channels[1], 1, 2, dropout_rate)  # Stage 3 (spatial size: 8x8) - 64
-    upsamp4 = _add_upsamp_group(upsamp3, n_channels[0], 1, 2, dropout_rate)  # Stage 3 (spatial size: 16x16) - 128
-    upsamp5 = _add_upsamp_group(upsamp4, num_classes, 1, 2, dropout_rate)  # Stage 3 (spatial size: 32x32) - 256
+    block_fn = partial(_wide_basic,direction='up')#decoder blocks,keep n=1 
+    upconv1 = _layer(block_fn, n_input_plane=n_stages[6], n_output_plane=n_stages[2], count=1, stride=(2,2))(conv7)# "Stage 1up (spatial size: 2x2)"
+    upconv2 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[2], count=1, stride=(2,2))(upconv1)# "Stage 1up (spatial size: 4x4)"
+    upconv3 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[1], count=1, stride=(2,2))(upconv2)# "Stage 2up (spatial size: 8x8)"
+    upconv4 = _layer(block_fn, n_input_plane=n_stages[1], n_output_plane=n_stages[0], count=1, stride=(2,2))(upconv3)# "Stage 3up (spatial size: 16x16)"
+    upconv5 = _layer(block_fn, n_input_plane=n_stages[0], n_output_plane=num_classes, count=1, stride=(2,2))(upconv4)# "Stage 4up (spatial size: 32x32)"
 
-    #add another non-linear layer?
-    logit = Lambda(lambda x:x,name='logit')(upsamp5) 
-    out = Activation(final_activation)(logit)
-    #f_x = Lambda(lambda x:x,name='f_x')(out)
-
-    if ret_intermediate:
-        return Model(inp,[out,logit])
-
+    logit = Lambda(lambda x:x,name='logit')(upconv5)
+    if final_activation == 'linear':
+        outputs = logit
     else:
-        return Model(inp, out)
+        outputs = Activation(final_activation)(logit)
+
+    loss_f = 'categorical_crossentropy' if num_classes > 1 \
+            else 'binary_crossentropy'
+
+    return Model(inputs, outputs), loss_f
 
 
-
-def create_wide_residual_network_selfsup(input_shape, *args, **kwargs):
+def create_wide_residual_network_selfsup(input_shape,*args,**kwargs):
     if 'net_f' in kwargs:
-        net_f = globals()[kwargs['net_f']]#get func for network based on kwarg name
-        del kwargs['net_f']#get rid of it before passing on kwargs
+        net_f = globals()[kwargs['net_f']]
+        del kwargs['net_f']
     else:
         net_f = create_wide_residual_network_dec
-    print('Building with network: ' +net_f.__name__+ '\n')#for verification
+    print('Building with network: ' + net_f.__name__+ '\n')
 
-    net = net_f(input_shape,*args,**kwargs)
-
-    inp = Input(shape=input_shape)
-
-    f_x = net(inp)#regular inference
-   
-
-    net_ss = Model(inp,f_x)
+    net_ss,loss_f = net_f(input_shape,*args,**kwargs)
     
-    return net_ss
- 
+    optim = Adam(lr=0.001)    
+    #optim = SGD(lr=0.001)    
+    #optim = SGD(lr=0.1, momentum=0.9, nesterov=True)
 
- 
- 
+    net_ss.compile(optim,[loss_f],['acc'])
+
+    return net_ss
+
+       
