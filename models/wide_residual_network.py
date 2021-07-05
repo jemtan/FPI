@@ -215,8 +215,8 @@ def create_wide_residual_network_decdeeper(input_shape,num_classes,depth,k=4,dro
         final_activation = 'softmax' if num_classes > 1 \
             else 'sigmoid'
    
-    assert((depth - 6) % 10 == 0), 'depth should be 10n+6'
-    n = (depth - 6) // 10
+    assert((depth - 7) % 12 == 0), 'depth should be 12n+7'
+    n = (depth - 7) // 12
     
     inputs = Input(shape=input_shape)
 

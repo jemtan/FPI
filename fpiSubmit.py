@@ -63,7 +63,7 @@ def get_mdl(data,data_frame,restore=False):
         n, k = (16,4)#network size
         net_f='create_wide_residual_network_dec'
         n_classes = 1
-        model_dir = 'restore_dir/brain/'
+        model_dir = '/workspace/restore_dir/brain/'
 
     elif 'abdom' in data:
         n, k = (19,4)#network size
