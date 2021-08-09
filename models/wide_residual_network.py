@@ -238,7 +238,7 @@ def create_wide_residual_network_decdeeper(input_shape,num_classes,depth,k=4,dro
     conv4 = _layer(block_fn, n_input_plane=n_stages[2], n_output_plane=n_stages[3], count=n, stride=(2,2))(conv3)# "Stage 3 (spatial size: 8x8)"
     conv5 = _layer(block_fn, n_input_plane=n_stages[3], n_output_plane=n_stages[4], count=n, stride=(2,2))(conv4)# "Stage 4 (spatial size: 4x4)"
     conv6 = _layer(block_fn, n_input_plane=n_stages[4], n_output_plane=n_stages[5], count=n, stride=(2,2))(conv5)# "Stage 5 (spatial size: 2x2)"
-    conv7 = _layer(block_fn, n_input_plane=n_stages[5], n_output_plane=n_stages[6], count=n, stride=(2,2))(conv5)# "Stage 6 (spatial size: 1x1)"
+    conv7 = _layer(block_fn, n_input_plane=n_stages[5], n_output_plane=n_stages[6], count=n, stride=(2,2))(conv6)# "Stage 6 (spatial size: 1x1)"
 
 
     block_fn = partial(_wide_basic,direction='up')#decoder blocks,keep n=1 
